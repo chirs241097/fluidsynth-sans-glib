@@ -355,6 +355,13 @@ static DWORD WINAPI fluid_wasapi_audio_run(void *p)
     OSVERSIONINFOEXW vi = {sizeof(vi), 6, 0, 0, 0, {0}, 0, 0, 0, 0, 0};
     int needs_com_uninit = FALSE;
     int i;
+    HANDLE buffer_ready_ev;
+    HANDLE evts[2] = {NULL, dev->quit_ev};
+    HMODULE avrtmod = NULL;
+    HANDLE(WINAPI *AvSetMmThreadCharacteristicsW)(LPCWSTR, LPDWORD) = NULL;
+    BOOL(WINAPI *AvRevertMmThreadCharacteristics)(HANDLE) = NULL;
+    HANDLE avrttask;
+    DWORD avrttaskid = 0;
 
     /* Clear format structure */
     ZeroMemory(&wfx, sizeof(WAVEFORMATEXTENSIBLE));
@@ -411,10 +418,20 @@ static DWORD WINAPI fluid_wasapi_audio_run(void *p)
         goto cleanup;
     }
 
-
     if(dev->exclusive)
     {
         share_mode = AUDCLNT_SHAREMODE_EXCLUSIVE;
+        flags |= AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+        buffer_ready_ev = CreateEvent(NULL, FALSE, FALSE, NULL);
+        if (buffer_ready_ev == NULL) {
+            FLUID_LOG(FLUID_ERR, "wasapi: cannot create buffer ready event.");
+            goto cleanup;
+        }
+        evts[0] = buffer_ready_ev;
+        dev->periods = 1;
+        dev->buffer_duration = dev->periods * dev->period_size / dev->sample_rate;
+        dev->buffer_duration_reftime = (fluid_long_long_t)(dev->buffer_duration * 1e7 + .5);
+
         FLUID_LOG(FLUID_DBG, "wasapi: using exclusive mode.");
     }
     else
@@ -448,7 +465,7 @@ static DWORD WINAPI fluid_wasapi_audio_run(void *p)
 
         if(rwfx->Format.nSamplesPerSec != wfx.Format.nSamplesPerSec) // needs resampling
         {
-            flags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM;
+            flags |= AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM;
             vi.dwMinorVersion = 1;
 
             if(VerifyVersionInfoW(&vi, VER_MAJORVERSION | VER_MINORVERSION | VER_SERVICEPACKMAJOR,
@@ -488,6 +505,16 @@ static DWORD WINAPI fluid_wasapi_audio_run(void *p)
         goto cleanup;
     }
 
+    if(dev->exclusive)
+    {
+        ret = IAudioClient_SetEventHandle(dev->aucl, buffer_ready_ev);
+        if(FAILED(ret))
+        {
+            FLUID_LOG(FLUID_ERR, "wasapi: failed to set buffer ready event.");
+            goto cleanup;
+        }
+    }
+
     ret = IAudioClient_GetBufferSize(dev->aucl, &dev->nframes);
 
     if(FAILED(ret))
@@ -502,6 +529,10 @@ static DWORD WINAPI fluid_wasapi_audio_run(void *p)
     if(time_to_sleep < 1)
     {
         time_to_sleep = 1;
+    }
+    if(dev->exclusive)
+    {
+        time_to_sleep = 2000;
     }
 
     dev->drybuf = FLUID_ARRAY(float *, dev->audio_channels * 2);
@@ -538,6 +569,29 @@ static DWORD WINAPI fluid_wasapi_audio_run(void *p)
         FLUID_LOG(FLUID_DBG, "wasapi: latency: %fms.", dev->latency_reftime / 1e4);
     }
 
+    // Tell Windows we are doing "Pro audio" stuff
+    // avrt.dll is only available in Windows Vista or higher so we can't just implicitly link it.
+    avrtmod = LoadLibraryW(L"avrt.dll");
+    if(avrtmod == NULL) {
+        FLUID_LOG(FLUID_WARN, "avrt failed1");
+        goto skipavrt;
+    }
+    AvSetMmThreadCharacteristicsW  = (HANDLE(WINAPI *)(LPCWSTR, LPDWORD))GetProcAddress(avrtmod, "AvSetMmThreadCharacteristicsW");
+    AvRevertMmThreadCharacteristics = (BOOL(WINAPI *)(HANDLE))GetProcAddress(avrtmod, "AvRevertMmThreadCharacteristics");
+    if(AvSetMmThreadCharacteristicsW == NULL || AvRevertMmThreadCharacteristics == NULL) {
+        FreeLibrary(avrtmod);
+        avrtmod = NULL;
+        FLUID_LOG(FLUID_WARN, "avrt failed2");
+        goto skipavrt;
+    }
+    avrttask = AvSetMmThreadCharacteristicsW(L"Pro Audio", &avrttaskid);
+    if(avrttask == NULL)
+    {
+        FLUID_LOG(FLUID_WARN, "avrt failed3");
+    }
+
+skipavrt:
+
     ret = IAudioClient_Start(dev->aucl);
 
     if(FAILED(ret))
@@ -551,12 +605,19 @@ static DWORD WINAPI fluid_wasapi_audio_run(void *p)
 
     for(;;)
     {
-        ret = IAudioClient_GetCurrentPadding(dev->aucl, &pos);
-
-        if(FAILED(ret))
+        if(dev->exclusive)
         {
-            FLUID_LOG(FLUID_ERR, "wasapi: cannot get buffer padding. 0x%x", (unsigned)ret);
-            goto cleanup;
+            pos = 0;
+        }
+        else
+        {
+            ret = IAudioClient_GetCurrentPadding(dev->aucl, &pos);
+
+            if(FAILED(ret))
+            {
+                FLUID_LOG(FLUID_ERR, "wasapi: cannot get buffer padding. 0x%x", (unsigned)ret);
+                goto cleanup;
+            }
         }
 
         len = dev->nframes - pos;
@@ -588,9 +649,29 @@ static DWORD WINAPI fluid_wasapi_audio_run(void *p)
             goto cleanup;
         }
 
-        if(WaitForSingleObject(dev->quit_ev, time_to_sleep) == WAIT_OBJECT_0)
+        if(dev->exclusive)
         {
-            break;
+            DWORD wret = WaitForMultipleObjects(2, evts, 0, time_to_sleep);
+            if(wret - WAIT_OBJECT_0 == 1) //quit_ev
+            {
+                break;
+            }
+            if(wret == WAIT_TIMEOUT)
+            {
+                FLUID_LOG(FLUID_ERR, "wasapi: timeout waiting for buffer ready event.");
+                break;
+            }
+            if(wret == WAIT_FAILED)
+            {
+                FLUID_LOG(FLUID_ERR, "wasapi: wait failed: %lu.", GetLastError());
+            }
+        }
+        else
+        {
+            if(WaitForSingleObject(dev->quit_ev, time_to_sleep) == WAIT_OBJECT_0)
+            {
+                break;
+            }
         }
     }
 
@@ -615,6 +696,17 @@ cleanup:
     if(denum != NULL)
     {
         IMMDeviceEnumerator_Release(denum);
+    }
+
+    if(buffer_ready_ev != NULL)
+    {
+        CloseHandle(buffer_ready_ev);
+    }
+
+    if(avrtmod != NULL)
+    {
+        AvRevertMmThreadCharacteristics(avrttask);
+        FreeLibrary(avrtmod);
     }
 
     if(needs_com_uninit)
