@@ -1,5 +1,7 @@
 # Fluidsynth sans GLib
 
+**OBSOLETE.** Current mainline FluidSynth implements the solution used in this patchset. Check out the `osal` option in the build configuration.
+
 Let's be real. Using GLib on any non-POSIX platform is a PITA. Hence this fork.
 
 This is the adaption of my old patchset archived [here](https://github.com/chirs241097/fluidsynth).
